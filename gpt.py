@@ -220,7 +220,7 @@ if __name__ == "__main__":
     # hyperparameters
     batch_size = 32  # how many independent sequences will we process in parallel?
     block_size = 256  # what is the maximum context length for predictions?
-    max_iters = 500
+    max_iters = 1000
     eval_interval = 100
     learning_rate = 3e-4
     device = (
@@ -230,8 +230,8 @@ if __name__ == "__main__":
     )
     eval_iters = 50
     n_embd = 384
-    n_head = 6
-    n_layer = 6
+    n_head = 3
+    n_layer = 4
     dropout = 0.2
     # ------------
 
@@ -276,6 +276,6 @@ if __name__ == "__main__":
     tic = time.time()
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
     print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-    print("Generate time:", time.time() - tic)
+    print("\nGenerate time:", time.time() - tic)
 
     # open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
