@@ -293,6 +293,8 @@ if __name__ == "__main__":
             "n_head": 3,
             "n_layer": 4,
             "dropout": 0.2,
+            "encode": encode,
+            "decode": decode,
         }
         model = GPTLanguageModel(
             hyperparameters["vocab_size"],
@@ -346,7 +348,7 @@ if __name__ == "__main__":
     # generate from the model
     # tic = time.time()
     # context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    # print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+    # print(hyperparameters["decode"](m.generate(context, max_new_tokens=500)[0].tolist()))
     # print("\nGenerate time:", time.time() - tic)
 
-    # open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+    # open('more.txt', 'w').write(hyperparameters["decode"](m.generate(context, max_new_tokens=10000)[0].tolist()))
