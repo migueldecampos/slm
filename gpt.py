@@ -31,17 +31,21 @@ def get_shakespeare_train_val_data():
 
 
 # data loading
-def get_batch(data, block_size, batch_size, device):
+def get_batch(data, block_size, batch_size, reverse, device):
     # generate a small batch of data of inputs x and targets y
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    low = 0 if not reverse else 1
+    ix = torch.randint(low=low, high=len(data) - block_size, size=(batch_size,))
     x = torch.stack([data[i : i + block_size] for i in ix])
-    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
+    if reverse:
+        y = torch.stack([data[i - 1 : i + block_size - 1] for i in ix])
+    else:
+        y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
     x, y = x.to(device), y.to(device)
     return x, y
 
 
 @torch.no_grad()
-def estimate_loss(data_dict, eval_iters, block_size, batch_size, device):
+def estimate_loss(data_dict, eval_iters, block_size, batch_size, reverse, device):
     """
     receives a dict containing data splits and their names
     e.g. {'train': <data>, 'val: <data>'}
@@ -51,7 +55,7 @@ def estimate_loss(data_dict, eval_iters, block_size, batch_size, device):
     for split in data_dict:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(data_dict[split], block_size, batch_size, device)
+            X, Y = get_batch(data_dict[split], block_size, batch_size, reverse, device)
             logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
@@ -62,12 +66,15 @@ def estimate_loss(data_dict, eval_iters, block_size, batch_size, device):
 class Head(nn.Module):
     """one head of self-attention"""
 
-    def __init__(self, head_size, n_embd, block_size, dropout):
+    def __init__(self, head_size, n_embd, block_size, dropout, reverse):
         super().__init__()
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        if reverse:
+            self.register_buffer("tri", torch.triu(torch.ones(block_size, block_size)))
+        else:
+            self.register_buffer("tri", torch.tril(torch.ones(block_size, block_size)))
 
         self.dropout = nn.Dropout(dropout)
 
@@ -81,7 +88,7 @@ class Head(nn.Module):
         wei = (
             q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
         )  # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
+        wei = wei.masked_fill(self.tri[:T, :T] == 0, float("-inf"))  # (B, T, T)
         wei = F.softmax(wei, dim=-1)  # (B, T, T)
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
@@ -93,10 +100,13 @@ class Head(nn.Module):
 class MultiHeadAttention(nn.Module):
     """multiple heads of self-attention in parallel"""
 
-    def __init__(self, n_embd, num_heads, head_size, block_size, dropout):
+    def __init__(self, n_embd, num_heads, head_size, block_size, dropout, reverse):
         super().__init__()
         self.heads = nn.ModuleList(
-            [Head(head_size, n_embd, block_size, dropout) for _ in range(num_heads)]
+            [
+                Head(head_size, n_embd, block_size, dropout, reverse)
+                for _ in range(num_heads)
+            ]
         )
         self.proj = nn.Linear(head_size * num_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
@@ -126,11 +136,13 @@ class FeedFoward(nn.Module):
 class Block(nn.Module):
     """Transformer block: communication followed by computation"""
 
-    def __init__(self, n_embd, n_head, block_size, dropout):
+    def __init__(self, n_embd, n_head, block_size, dropout, reverse):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
         head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_embd, n_head, head_size, block_size, dropout)
+        self.sa = MultiHeadAttention(
+            n_embd, n_head, head_size, block_size, dropout, reverse
+        )
         self.ffwd = FeedFoward(n_embd, dropout)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
@@ -143,18 +155,25 @@ class Block(nn.Module):
 
 class GPTLanguageModel(nn.Module):
     def __init__(
-        self, vocab_size, n_embd, block_size, n_head, n_layer, dropout, device
+        self, vocab_size, n_embd, block_size, n_head, n_layer, dropout, reverse, device
     ):
         super().__init__()
         self.device = device
         self.block_size = block_size
+        self.reverse = reverse
 
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(
             *[
-                Block(n_embd, n_head=n_head, block_size=block_size, dropout=dropout)
+                Block(
+                    n_embd,
+                    n_head=n_head,
+                    block_size=block_size,
+                    dropout=dropout,
+                    reverse=self.reverse,
+                )
                 for _ in range(n_layer)
             ]
         )
@@ -198,18 +217,31 @@ class GPTLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
-            # crop idx to the last block_size tokens
-            idx_cond = idx[:, -self.block_size :]
+            if self.reverse:
+                # crop idx to the first block_size tokens
+                idx_cond = idx[:, : self.block_size]
+            else:
+                # crop idx to the last block_size tokens
+                idx_cond = idx[:, -self.block_size :]
             # get the predictions
             logits, loss = self(idx_cond)
-            # focus only on the last time step
-            logits = logits[:, -1, :]  # becomes (B, C)
+            if self.reverse:
+                # focus only on first "time step"
+                logits = logits[:, 0, :]  # becomes (B, C)
+            else:
+                # focus only on the last "time step"
+                logits = logits[:, -1, :]  # becomes (B, C)
             # apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)  # (B, C)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
             # append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+            if self.reverse:
+                # either at the start
+                idx = torch.cat((idx_next, idx), dim=1)  # (B, T+1)
+            else:
+                # or at the end
+                idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
         return idx
 
 
@@ -223,6 +255,7 @@ def train(
     eval_iters,
     block_size,
     batch_size,
+    reverse,
     device,
 ):
     m = model.to(device)
@@ -238,6 +271,7 @@ def train(
                 eval_iters,
                 block_size,
                 batch_size,
+                reverse,
                 device,
             )
             loss_timeline.append(losses)
@@ -246,7 +280,7 @@ def train(
             )
 
         # sample a batch of data
-        xb, yb = get_batch(train_data, block_size, batch_size, device)
+        xb, yb = get_batch(train_data, block_size, batch_size, reverse, device)
         # evaluate the loss
         logits, loss = m(xb, yb)
         optimizer.zero_grad(set_to_none=True)
@@ -260,7 +294,17 @@ if __name__ == "__main__":
     import sys
     import json
 
-    # device
+    # Arguments
+    args = dict()
+    i = 1
+    while i < len(sys.argv) - 1:
+        if sys.argv[i].startswith("--"):
+            args[sys.argv[i][2:]] = sys.argv[i + 1]
+        else:
+            break
+        i += 2
+
+    # Shecking availability of gpu
     device = (
         "mps"
         if torch.backends.mps.is_available()
@@ -269,41 +313,44 @@ if __name__ == "__main__":
     # ------------
     vocab_size, train_data, val_data, encode, decode = get_shakespeare_train_val_data()
 
-    # Starting from checkpoint or from scratch?
-    if len(sys.argv) == 3 and sys.argv[1] == "--from_checkpoint":
-        with open(sys.argv[2], "rb") as f:
+    # Start from checkpoint or from scratch
+    if "from_checkpoint" in args:
+        with open(args["from_checkpoint"], "rb") as f:
             checkpoint = torch.load(f)
         hyperparameters = checkpoint["hyperparameters"]
         model = checkpoint["model"]
         loss_timeline = checkpoint["loss_timeline"]
         model.device = device
     else:
-        # setting seed so that we have comparable runs
+        # Setting seed so that we have comparable runs
         torch.manual_seed(1337)
         # hyperparameters
         hyperparameters = {
             "vocab_size": vocab_size,
             "batch_size": 32,  # how many independent sequences will we process in parallel?
             "block_size": 256,  # what is the maximum context length for predictions?
-            "max_iters": 500,
-            "eval_interval": 100,
+            "max_iters": 1000,
+            "eval_interval": 200,
             "learning_rate": 3e-4,
             "eval_iters": 50,
             "n_embd": 384,
             "n_head": 3,
             "n_layer": 4,
             "dropout": 0.2,
-            "encode": encode,
-            "decode": decode,
+            "reverse": True if args.get("reverse", "").lower() == "true" else False,
         }
+        print("hyperparameters:")
+        print(hyperparameters)
+        print()
         model = GPTLanguageModel(
-            hyperparameters["vocab_size"],
-            hyperparameters["n_embd"],
-            hyperparameters["block_size"],
-            hyperparameters["n_head"],
-            hyperparameters["n_layer"],
-            hyperparameters["dropout"],
-            device,
+            vocab_size=hyperparameters["vocab_size"],
+            n_embd=hyperparameters["n_embd"],
+            block_size=hyperparameters["block_size"],
+            n_head=hyperparameters["n_head"],
+            n_layer=hyperparameters["n_layer"],
+            dropout=hyperparameters["dropout"],
+            reverse=hyperparameters["reverse"],
+            device=device,
         )
         loss_timeline = list()
 
@@ -320,6 +367,7 @@ if __name__ == "__main__":
         hyperparameters["eval_iters"],
         hyperparameters["block_size"],
         hyperparameters["batch_size"],
+        hyperparameters["reverse"],
         device,
     )
 
@@ -346,9 +394,12 @@ if __name__ == "__main__":
         )
 
     # generate from the model
-    # tic = time.time()
-    # context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    # print(hyperparameters["decode"](m.generate(context, max_new_tokens=500)[0].tolist()))
-    # print("\nGenerate time:", time.time() - tic)
-
-    # open('more.txt', 'w').write(hyperparameters["decode"](m.generate(context, max_new_tokens=10000)[0].tolist()))
+    tic = time.time()
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    if hyperparameters["reverse"]:
+        context[0][0] = encode(".")[0]
+    generation = decode(model.generate(context, max_new_tokens=500)[0].tolist())
+    print(generation)
+    print("\nGenerate time:", time.time() - tic)
+    with open("{}.txt".format(checkpoint_id), "w") as f:
+        f.write(generation)
