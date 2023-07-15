@@ -3,53 +3,37 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# hyperparameters
-batch_size = 64  # how many independent sequences will we process in parallel?
-block_size = 256  # what is the maximum context length for predictions?
-max_iters = 5000
-eval_interval = 500
-learning_rate = 3e-4
-device = (
-    "mps"
-    if torch.backends.mps.is_available()
-    else ("cuda" if torch.cuda.is_available() else "cpu")
-)
-eval_iters = 200
-n_embd = 384
-n_head = 6
-n_layer = 6
-dropout = 0.2
-# ------------
-
 torch.manual_seed(1337)
 
-with open("tiny_shakespeare.txt", "r", encoding="utf-8") as f:
-    text = f.read()
 
-# here are all the unique characters that occur in this text
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
-# create a mapping from characters to integers
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
-encode = lambda s: [
-    stoi[c] for c in s
-]  # encoder: take a string, output a list of integers
-decode = lambda l: "".join(
-    [itos[i] for i in l]
-)  # decoder: take a list of integers, output a string
+def get_shakespeare_train_val_data():
+    with open("tiny_shakespeare.txt", "r", encoding="utf-8") as f:
+        text = f.read()
 
-# Train and test splits
-data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9 * len(data))  # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
+    # here are all the unique characters that occur in this text
+    chars = sorted(list(set(text)))
+    vocab_size = len(chars)
+    # create a mapping from characters to integers
+    stoi = {ch: i for i, ch in enumerate(chars)}
+    itos = {i: ch for i, ch in enumerate(chars)}
+    encode = lambda s: [
+        stoi[c] for c in s
+    ]  # encoder: take a string, output a list of integers
+    decode = lambda l: "".join(
+        [itos[i] for i in l]
+    )  # decoder: take a list of integers, output a string
+
+    # Train and test splits
+    data = torch.tensor(encode(text), dtype=torch.long)
+    n = int(0.9 * len(data))  # first 90% will be train, rest val
+    train_data = data[:n]
+    val_data = data[n:]
+    return vocab_size, train_data, val_data, encode, decode
 
 
 # data loading
-def get_batch(split):
+def get_batch(data, block_size, batch_size, device):
     # generate a small batch of data of inputs x and targets y
-    data = train_data if split == "train" else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i : i + block_size] for i in ix])
     y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
@@ -58,13 +42,17 @@ def get_batch(split):
 
 
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(data_dict, eval_iters, block_size, batch_size, device):
+    """
+    receives a dict containing data splits and their names
+    e.g. {'train': <data>, 'val: <data>'}
+    """
     out = {}
     model.eval()
-    for split in ["train", "val"]:
+    for split in data_dict:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y = get_batch(data_dict[split], block_size, batch_size, device)
             logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
@@ -75,7 +63,7 @@ def estimate_loss():
 class Head(nn.Module):
     """one head of self-attention"""
 
-    def __init__(self, head_size):
+    def __init__(self, head_size, n_embd, block_size, dropout):
         super().__init__()
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
@@ -106,9 +94,11 @@ class Head(nn.Module):
 class MultiHeadAttention(nn.Module):
     """multiple heads of self-attention in parallel"""
 
-    def __init__(self, num_heads, head_size):
+    def __init__(self, n_embd, num_heads, head_size, block_size, dropout):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.heads = nn.ModuleList(
+            [Head(head_size, n_embd, block_size, dropout) for _ in range(num_heads)]
+        )
         self.proj = nn.Linear(head_size * num_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
 
@@ -121,7 +111,7 @@ class MultiHeadAttention(nn.Module):
 class FeedFoward(nn.Module):
     """a simple linear layer followed by a non-linearity"""
 
-    def __init__(self, n_embd):
+    def __init__(self, n_embd, dropout):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
@@ -137,12 +127,12 @@ class FeedFoward(nn.Module):
 class Block(nn.Module):
     """Transformer block: communication followed by computation"""
 
-    def __init__(self, n_embd, n_head):
+    def __init__(self, n_embd, n_head, block_size, dropout):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
         head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedFoward(n_embd)
+        self.sa = MultiHeadAttention(n_embd, n_head, head_size, block_size, dropout)
+        self.ffwd = FeedFoward(n_embd, dropout)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
@@ -153,13 +143,21 @@ class Block(nn.Module):
 
 
 class GPTLanguageModel(nn.Module):
-    def __init__(self):
+    def __init__(
+        self, vocab_size, n_embd, block_size, n_head, n_layer, dropout, device
+    ):
         super().__init__()
+        self.device = device
+        self.block_size = block_size
+
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(
-            *[Block(n_embd, n_head=n_head) for _ in range(n_layer)]
+            *[
+                Block(n_embd, n_head=n_head, block_size=block_size, dropout=dropout)
+                for _ in range(n_layer)
+            ]
         )
         self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
@@ -180,7 +178,9 @@ class GPTLanguageModel(nn.Module):
 
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T,C)
+        pos_emb = self.position_embedding_table(
+            torch.arange(T, device=self.device)
+        )  # (T,C)
         x = tok_emb + pos_emb  # (B,T,C)
         x = self.blocks(x)  # (B,T,C)
         x = self.ln_f(x)  # (B,T,C)
@@ -200,7 +200,7 @@ class GPTLanguageModel(nn.Module):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
-            idx_cond = idx[:, -block_size:]
+            idx_cond = idx[:, -self.block_size :]
             # get the predictions
             logits, loss = self(idx_cond)
             # focus only on the last time step
@@ -214,32 +214,68 @@ class GPTLanguageModel(nn.Module):
         return idx
 
 
-model = GPTLanguageModel()
-m = model.to(device)
-# print the number of parameters in the model
-print(sum(p.numel() for p in m.parameters()) / 1e6, "M parameters")
+if __name__ == "__main__":
+    import time
 
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    # hyperparameters
+    batch_size = 32  # how many independent sequences will we process in parallel?
+    block_size = 256  # what is the maximum context length for predictions?
+    max_iters = 500
+    eval_interval = 100
+    learning_rate = 3e-4
+    device = (
+        "mps"
+        if torch.backends.mps.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    eval_iters = 50
+    n_embd = 384
+    n_head = 6
+    n_layer = 6
+    dropout = 0.2
+    # ------------
 
-for iter in range(max_iters):
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0 or iter == max_iters - 1:
-        losses = estimate_loss()
-        print(
-            f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-        )
+    vocab_size, train_data, val_data, encode, decode = get_shakespeare_train_val_data()
 
-    # sample a batch of data
-    xb, yb = get_batch("train")
+    model = GPTLanguageModel(
+        vocab_size, n_embd, block_size, n_head, n_layer, dropout, device
+    )
+    m = model.to(device)
+    # print the number of parameters in the model
+    print(sum(p.numel() for p in m.parameters()) / 1e6, "M parameters")
 
-    # evaluate the loss
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+    # create a PyTorch optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-# generate from the model
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-# open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+    tic = time.time()
+    for iter in range(max_iters):
+        # every once in a while evaluate the loss on train and val sets
+        if iter % eval_interval == 0 or iter == max_iters - 1:
+            losses = estimate_loss(
+                {"train": train_data, "val": val_data},
+                eval_iters,
+                block_size,
+                batch_size,
+                device,
+            )
+            print(
+                f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+            )
+
+        # sample a batch of data
+        xb, yb = get_batch(train_data, block_size, batch_size, device)
+
+        # evaluate the loss
+        logits, loss = model(xb, yb)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+    print("Training time:", time.time() - tic)
+
+    # generate from the model
+    tic = time.time()
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+    print("Generate time:", time.time() - tic)
+
+    # open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
