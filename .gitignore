@@ -1,1 +1,3 @@
 .slm/*
+checkpoints/*
+__pycache__/*

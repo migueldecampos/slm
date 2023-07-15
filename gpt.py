@@ -1,9 +1,8 @@
 # copied from https://github.com/karpathy/ng-video-lecture/blob/master/gpt.py
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
-torch.manual_seed(1337)
 
 
 def get_shakespeare_train_val_data():
@@ -214,40 +213,23 @@ class GPTLanguageModel(nn.Module):
         return idx
 
 
-if __name__ == "__main__":
-    import time
-
-    # hyperparameters
-    batch_size = 32  # how many independent sequences will we process in parallel?
-    block_size = 256  # what is the maximum context length for predictions?
-    max_iters = 1000
-    eval_interval = 100
-    learning_rate = 3e-4
-    device = (
-        "mps"
-        if torch.backends.mps.is_available()
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    eval_iters = 50
-    n_embd = 384
-    n_head = 3
-    n_layer = 4
-    dropout = 0.2
-    # ------------
-
-    vocab_size, train_data, val_data, encode, decode = get_shakespeare_train_val_data()
-
-    model = GPTLanguageModel(
-        vocab_size, n_embd, block_size, n_head, n_layer, dropout, device
-    )
+def train(
+    model,
+    train_data,
+    val_data,
+    learning_rate,
+    max_iters,
+    eval_interval,
+    eval_iters,
+    block_size,
+    batch_size,
+    device,
+):
     m = model.to(device)
-    # print the number of parameters in the model
-    print(sum(p.numel() for p in m.parameters()) / 1e6, "M parameters")
-
     # create a PyTorch optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
+    optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
     tic = time.time()
+    loss_timeline = list()
     for iter in range(max_iters):
         # every once in a while evaluate the loss on train and val sets
         if iter % eval_interval == 0 or iter == max_iters - 1:
@@ -258,24 +240,113 @@ if __name__ == "__main__":
                 batch_size,
                 device,
             )
+            loss_timeline.append(losses)
             print(
                 f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
             )
 
         # sample a batch of data
         xb, yb = get_batch(train_data, block_size, batch_size, device)
-
         # evaluate the loss
-        logits, loss = model(xb, yb)
+        logits, loss = m(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
     print("Training time:", time.time() - tic)
+    return loss_timeline
+
+
+if __name__ == "__main__":
+    import sys
+    import json
+
+    # device
+    device = (
+        "mps"
+        if torch.backends.mps.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    # ------------
+    vocab_size, train_data, val_data, encode, decode = get_shakespeare_train_val_data()
+
+    # Starting from checkpoint or from scratch?
+    if len(sys.argv) == 3 and sys.argv[1] == "--from_checkpoint":
+        with open(sys.argv[2], "rb") as f:
+            checkpoint = torch.load(f)
+        hyperparameters = checkpoint["hyperparameters"]
+        model = checkpoint["model"]
+        loss_timeline = checkpoint["loss_timeline"]
+        model.device = device
+    else:
+        # setting seed so that we have comparable runs
+        torch.manual_seed(1337)
+        # hyperparameters
+        hyperparameters = {
+            "vocab_size": vocab_size,
+            "batch_size": 32,  # how many independent sequences will we process in parallel?
+            "block_size": 256,  # what is the maximum context length for predictions?
+            "max_iters": 500,
+            "eval_interval": 100,
+            "learning_rate": 3e-4,
+            "eval_iters": 50,
+            "n_embd": 384,
+            "n_head": 3,
+            "n_layer": 4,
+            "dropout": 0.2,
+        }
+        model = GPTLanguageModel(
+            hyperparameters["vocab_size"],
+            hyperparameters["n_embd"],
+            hyperparameters["block_size"],
+            hyperparameters["n_head"],
+            hyperparameters["n_layer"],
+            hyperparameters["dropout"],
+            device,
+        )
+        loss_timeline = list()
+
+    # print the number of parameters in the model
+    print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
+
+    loss_timeline = loss_timeline + train(
+        model,
+        train_data,
+        val_data,
+        hyperparameters["learning_rate"],
+        hyperparameters["max_iters"],
+        hyperparameters["eval_interval"],
+        hyperparameters["eval_iters"],
+        hyperparameters["block_size"],
+        hyperparameters["batch_size"],
+        device,
+    )
+
+    checkpoint_id = "checkpoints/checkpoint_{}".format(int(time.time()))
+    with open("{}.pt".format(checkpoint_id), "wb") as f:
+        torch.save(
+            {
+                "hyperparameters": hyperparameters,
+                "model": model,
+                "loss_timeline": loss_timeline,
+            },
+            f,
+        )
+    with open("{}.json".format(checkpoint_id), "w") as f:
+        json.dump(
+            {
+                "hyperparameters": hyperparameters,
+                "loss_timeline": [
+                    {k: loss_dict[k].item() for k in loss_dict}
+                    for loss_dict in loss_timeline
+                ],
+            },
+            f,
+        )
 
     # generate from the model
-    tic = time.time()
-    context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-    print("\nGenerate time:", time.time() - tic)
+    # tic = time.time()
+    # context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    # print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+    # print("\nGenerate time:", time.time() - tic)
 
     # open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
