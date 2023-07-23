@@ -43,11 +43,17 @@ def get_batch(data, block_size, batch_size, prediction_mode, device):
     low = 0 if prediction_mode == NEXT_TOKEN else 1
     ix = torch.randint(low=low, high=len(data) - block_size, size=(batch_size,))
     x = torch.stack([data[i : i + block_size] for i in ix])
-    if prediction_mode == PREV_TOKEN:
-        y = torch.stack([data[i - 1 : i + block_size - 1] for i in ix])
-    else:
-        y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
-    x, y = x.to(device), y.to(device)
+    x = x.to(device)
+    if prediction_mode in (PREV_TOKEN, BIDIRECTIONAL):
+        yp = torch.stack([data[i - 1 : i + block_size - 1] for i in ix])
+        yp = yp.to(device)
+        y = yp
+    if prediction_mode in (NEXT_TOKEN, BIDIRECTIONAL):
+        yn = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
+        yn = yn.to(device)
+        y = yn
+    if prediction_mode == BIDIRECTIONAL:
+        y = yp, yn
     return x, y
 
 
@@ -62,14 +68,21 @@ def estimate_loss(
     out = {}
     model.eval()
     for split in data_dict:
-        losses = torch.zeros(eval_iters)
+        losses = torch.zeros(eval_iters, 2)
         for k in range(eval_iters):
-            X, Y = get_batch(
+            x, y = get_batch(
                 data_dict[split], block_size, batch_size, prediction_mode, device
             )
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+            if prediction_mode == BIDIRECTIONAL:
+                for i, yt, mode in zip(range(len(y)), y, ("previous", "next")):
+                    logits, loss_mode = model(x, yt, bidirectional_mode=mode)
+                    losses[k, i] = loss_mode.item()
+            else:
+                logits, loss = model(x, y)
+                losses[k, 0] = loss.item()
+        out[split] = (
+            losses.mean() if prediction_mode == BIDIRECTIONAL else losses[:, 0].mean()
+        )
     model.train()
     return out
 
@@ -82,14 +95,54 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-        if prediction_mode == PREV_TOKEN:
-            self.register_buffer("tri", torch.triu(torch.ones(block_size, block_size)))
-        else:
-            self.register_buffer("tri", torch.tril(torch.ones(block_size, block_size)))
+        self.block_size = block_size
+        if prediction_mode in (PREV_TOKEN, BIDIRECTIONAL):
+            self.register_buffer("triu", torch.triu(torch.ones(block_size, block_size)))
+            self.register_buffer("tri", self.triu)
+        if prediction_mode in (NEXT_TOKEN, BIDIRECTIONAL):
+            self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+            self.register_buffer("tri", self.tril)
+        if prediction_mode == BIDIRECTIONAL:
+            self.register_buffer(
+                "pyr",
+                torch.cat(
+                    (
+                        torch.repeat_interleave(
+                            torch.flip(
+                                torch.tril(
+                                    torch.ones(block_size // 2, block_size // 2)
+                                ),
+                                dims=(1,),
+                            ),
+                            torch.tensor(
+                                [2 for i in range(block_size // 2)], dtype=torch.long
+                            ),
+                            dim=0,
+                        ),
+                        torch.cat(
+                            (
+                                torch.zeros(1, block_size // 2),
+                                torch.repeat_interleave(
+                                    torch.tril(
+                                        torch.ones(block_size // 2, block_size // 2)
+                                    ),
+                                    torch.tensor(
+                                        [2 for i in range(block_size // 2 - 1)] + [1],
+                                        dtype=torch.long,
+                                    ),
+                                    dim=0,
+                                ),
+                            ),
+                            dim=0,
+                        ),
+                    ),
+                    dim=1,
+                ),
+            )
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, bidirectional_mode):
         # input of size (batch, time-step, channels)
         # output of size (batch, time-step, head size)
         B, T, C = x.shape
@@ -99,7 +152,22 @@ class Head(nn.Module):
         wei = (
             q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
         )  # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tri[:T, :T] == 0, float("-inf"))  # (B, T, T)
+        if not bidirectional_mode:
+            wei = wei.masked_fill(self.tri[:T, :T] == 0, float("-inf"))  # (B, T, T)
+        elif bidirectional_mode == "previous":
+            wei = wei.masked_fill(self.triu[:T, :T] == 0, float("-inf"))  # (B, T, T)
+        elif bidirectional_mode == "next":
+            wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
+        elif bidirectional_mode == "bi":
+            wei = wei.masked_fill(
+                self.pyr[
+                    :T,
+                    (self.block_size - T) // 2 : self.block_size
+                    + (-(self.block_size - T)) // 2,
+                ]
+                == 0,
+                float("-inf"),
+            )  # (B, T, T)
         wei = F.softmax(wei, dim=-1)  # (B, T, T)
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
@@ -124,8 +192,10 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(head_size * num_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
+    def forward(self, x, bidirectional_mode):
+        out = torch.cat(
+            [h(x, bidirectional_mode=bidirectional_mode) for h in self.heads], dim=-1
+        )
         out = self.dropout(self.proj(out))
         return out
 
@@ -160,10 +230,11 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
+    def forward(self, inp):
+        x, bidirectional_mode = inp
+        x = x + self.sa(self.ln1(x), bidirectional_mode)
         x = x + self.ffwd(self.ln2(x))
-        return x
+        return (x, bidirectional_mode)
 
 
 class GPTLanguageModel(nn.Module):
@@ -199,7 +270,10 @@ class GPTLanguageModel(nn.Module):
             ]
         )
         self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
-        self.lm_head = nn.Linear(n_embd, vocab_size)
+        if self.prediction_mode in (PREV_TOKEN, NEXT_TOKEN):
+            self.lm_head = nn.Linear(n_embd, vocab_size)
+        else:
+            self.lm_head = nn.Linear(n_embd, vocab_size * 2)
 
         # better init, not covered in the original GPT video, but important, will cover in followup video
         self.apply(self._init_weights)
@@ -212,7 +286,7 @@ class GPTLanguageModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, bidirectional_mode=None):
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
@@ -221,7 +295,7 @@ class GPTLanguageModel(nn.Module):
             torch.arange(T, device=self.device)
         )  # (T,C)
         x = tok_emb + pos_emb  # (B,T,C)
-        x = self.blocks(x)  # (B,T,C)
+        x, _ = self.blocks((x, bidirectional_mode))  # (B,T,C)
         x = self.ln_f(x)  # (B,T,C)
         logits = self.lm_head(x)  # (B,T,vocab_size)
 
@@ -229,8 +303,15 @@ class GPTLanguageModel(nn.Module):
             loss = None
         else:
             B, T, C = logits.shape
-            logits = logits.view(B * T, C)
-            targets = targets.view(B * T)
+            if self.prediction_mode in (PREV_TOKEN, NEXT_TOKEN):
+                logits = logits.view(B * T, C)
+                targets = targets.view(B * T)
+            else:
+                if bidirectional_mode == "previous":
+                    logits = logits.view(B * T, C)[:, : C // 2]
+                if bidirectional_mode == "next":
+                    logits = logits.view(B * T, C)[:, C // 2 :]
+                targets = targets.view(B * T)
             loss = F.cross_entropy(logits, targets)
 
         return logits, loss
@@ -241,26 +322,49 @@ class GPTLanguageModel(nn.Module):
             if self.prediction_mode == PREV_TOKEN:
                 # crop idx to the first block_size tokens
                 idx_cond = idx[:, : self.block_size]
-            else:
+            elif self.prediction_mode == NEXT_TOKEN:
                 # crop idx to the last block_size tokens
                 idx_cond = idx[:, -self.block_size :]
+            elif self.prediction_mode == BIDIRECTIONAL:
+                _, l = idx.shape
+                if l > self.block_size:
+                    break
+                else:
+                    idx_cond = idx
             # get the predictions
-            logits, loss = self(idx_cond)
+            if self.prediction_mode == BIDIRECTIONAL:
+                logits, loss = self(idx_cond, bidirectional_mode="bi")
+            else:
+                logits, loss = self(idx_cond)
+            B, T, C = logits.shape
+            idx_prev = None
+            idx_next = None
             if self.prediction_mode == PREV_TOKEN:
                 # focus only on first "time step"
-                logits = logits[:, 0, :]  # becomes (B, C)
-            else:
+                logits_prev = logits[:, 0, :]  # becomes (B, C)
+                # apply softmax to get probabilities
+                probs = F.softmax(logits_prev, dim=-1)  # (B, C)
+                # sample from the distribution
+                idx_prev = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            elif self.prediction_mode == NEXT_TOKEN:
                 # focus only on the last "time step"
-                logits = logits[:, -1, :]  # becomes (B, C)
-            # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1)  # (B, C)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
-            # append sampled index to the running sequence
-            if self.prediction_mode == PREV_TOKEN:
-                # either at the start
-                idx = torch.cat((idx_next, idx), dim=1)  # (B, T+1)
+                logits_next = logits[:, -1, :]  # becomes (B, C)
+                # apply softmax to get probabilities
+                probs = F.softmax(logits_next, dim=-1)  # (B, C)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
             else:
+                logits_prev = logits[:, 0, : C // 2]  # becomes (B, C)
+                probs = F.softmax(logits_prev, dim=-1)  # (B, C)
+                idx_prev = torch.multinomial(probs, num_samples=1)  # (B, 1)
+                logits_next = logits[:, -1, C // 2 :]  # becomes (B, C)
+                probs = F.softmax(logits_next, dim=-1)  # (B, C)
+                idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            # append sampled index to the running sequence
+            if idx_prev is not None:
+                # either at the start
+                idx = torch.cat((idx_prev, idx), dim=1)  # (B, T+1)
+            if idx_next is not None:
                 # or at the end
                 idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
         return idx
@@ -301,9 +405,15 @@ def train(
             )
 
         # sample a batch of data
-        xb, yb = get_batch(train_data, block_size, batch_size, prediction_mode, device)
+        x, y = get_batch(train_data, block_size, batch_size, prediction_mode, device)
         # evaluate the loss
-        logits, loss = m(xb, yb)
+        if prediction_mode == BIDIRECTIONAL:
+            loss = 0
+            for target, mode in zip(y, ("previous", "next")):
+                logits, loss_mode = m(x, target, bidirectional_mode=mode)
+                loss += loss_mode
+        else:
+            logits, loss = m(x, y)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -427,9 +537,12 @@ if __name__ == "__main__":
 
     # generate from the model
     tic = time.time()
-    context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    if hyperparameters["prediction_mode"] == PREV_TOKEN:
-        context[0][0] = encode(".")[0]
+    if hyperparameters["prediction_mode"] == NEXT_TOKEN:
+        context = torch.tensor([encode("KING:")], device=device)
+    elif hyperparameters["prediction_mode"] == PREV_TOKEN:
+        context = torch.tensor([encode("the king.")], device=device)
+    else:
+        context = torch.tensor([encode("KING:")], device=device)
     generation = decode(model.generate(context, max_new_tokens=500)[0].tolist())
     print(generation)
     print("\nGenerate time:", time.time() - tic)
