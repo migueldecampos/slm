@@ -8,8 +8,8 @@ from torch.nn import functional as F
 # Prediction modes
 PREV_TOKEN = "previous_token"
 NEXT_TOKEN = "next_token"
-BIDERECTIONAL = "bidirectional"
-PREDICTION_MODES = [PREV_TOKEN, NEXT_TOKEN, BIDERECTIONAL]
+BIDIRECTIONAL = "bidirectional"
+PREDICTION_MODES = [PREV_TOKEN, NEXT_TOKEN, BIDIRECTIONAL]
 
 
 def get_shakespeare_train_val_data():
