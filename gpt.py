@@ -13,7 +13,7 @@ from constants import (
     PREDICTION_MODES,
     WRONG_PREDICTION_MODE,
 )
-from utils import plot_loss, save_checkpoint
+from utils import get_device, plot_loss, save_checkpoint
 from data_loaders import get_shakespeare, get_tinystories
 
 
@@ -327,13 +327,9 @@ if __name__ == "__main__":
     # End of handling of arguments
 
     # Checking gpu availability
-    device = (
-        "mps"
-        if torch.backends.mps.is_available()
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = get_device()
     # ------------
-    if args["data_source"] == TINYSTORIES_DATASOURCE:
+    if args["datasource"] == TINYSTORIES_DATASOURCE:
         vocab_size, get_train_batch, get_val_batch, encode, decode = get_tinystories()
     else:
         vocab_size, get_train_batch, get_val_batch, encode, decode = get_shakespeare()
@@ -351,7 +347,7 @@ if __name__ == "__main__":
         torch.manual_seed(1337)
         # hyperparameters
         hyperparameters = {
-            "datasource": args["data_source"],
+            "datasource": args["datasource"],
             "vocab_size": vocab_size,
             "batch_size": 128,  # how many independent sequences will we process in parallel?
             "block_size": 256,  # what is the maximum context length for predictions?

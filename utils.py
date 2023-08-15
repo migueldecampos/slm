@@ -4,6 +4,14 @@ import pandas as pd
 import torch
 
 
+def get_device():
+    return (
+        "mps"
+        if torch.backends.mps.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+
+
 def plot_loss(loss_timeline):
     iter_list = list()
     train_losses = list()
