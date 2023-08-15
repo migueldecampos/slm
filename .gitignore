@@ -2,3 +2,6 @@
 checkpoints/*
 __pycache__/*
 .DS_Store
+tinystories_metadata.json
+tokenized_tinystories_val.txt
+tokenized_tinystories_train.txt
