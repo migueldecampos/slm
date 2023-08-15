@@ -4,27 +4,31 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from constants import PREV_TOKEN, NEXT_TOKEN, PREDICTION_MODES, WRONG_PREDICTION_MODE
+from constants import (
+    DATASOURCES,
+    TINYSTORIES_DATASOURCE,
+    SHAKESPEARE_DATASOURCE,
+    PREV_TOKEN,
+    NEXT_TOKEN,
+    PREDICTION_MODES,
+    WRONG_PREDICTION_MODE,
+)
 from utils import plot_loss, save_checkpoint
-from data_loaders import get_shakespeare_train_val_data, get_batch
+from data_loaders import get_shakespeare, get_tinystories
 
 
 @torch.no_grad()
-def estimate_loss(
-    data_dict, eval_iters, block_size, batch_size, prediction_mode, device
-):
+def estimate_loss(batch_iterators_dict, eval_iters):
     """
     receives a dict containing data splits and their names
-    e.g. {'train': <data>, 'val: <data>'}
+    e.g. {'train': train_batch_iterator, 'val: val_batch_iterator'}
     """
     out = {}
     model.eval()
-    for split in data_dict:
+    for split in batch_iterators_dict:
         losses = torch.zeros(eval_iters, 2)
         for k in range(eval_iters):
-            x, y = get_batch(
-                data_dict[split], block_size, batch_size, prediction_mode, device
-            )
+            x, y = next(batch_iterators_dict[split])
             logits, loss = model(x, y)
             losses[k, 0] = loss.item()
         out[split] = losses[:, 0].mean()
@@ -240,7 +244,14 @@ class GPTLanguageModel(nn.Module):
         return idx
 
 
-def train(model, train_data, val_data, hyperparameters, device, checkpoint_id):
+def train(
+    model,
+    train_batch_iterator,
+    val_batch_iterator,
+    hyperparameters,
+    device,
+    checkpoint_id,
+):
     m = model.to(device)
     # create a PyTorch optimizer
     optimizer = torch.optim.AdamW(m.parameters(), lr=hyperparameters["learning_rate"])
@@ -253,12 +264,8 @@ def train(model, train_data, val_data, hyperparameters, device, checkpoint_id):
             or iter == hyperparameters["max_iters"] - 1
         ):
             losses = estimate_loss(
-                {"train": train_data, "val": val_data},
+                {"train": train_batch_iterator, "val": val_batch_iterator},
                 hyperparameters["eval_iters"],
-                hyperparameters["block_size"],
-                hyperparameters["batch_size"],
-                hyperparameters["prediction_mode"],
-                device,
             )
             loss_timeline.append((iter, losses))
             print(
@@ -278,13 +285,7 @@ def train(model, train_data, val_data, hyperparameters, device, checkpoint_id):
             )
 
         # sample a batch of data
-        x, y = get_batch(
-            train_data,
-            hyperparameters["block_size"],
-            hyperparameters["batch_size"],
-            hyperparameters["prediction_mode"],
-            device,
-        )
+        x, y = next(train_batch_iterator)
         # evaluate the loss
         logits, loss = m(x, y)
         optimizer.zero_grad(set_to_none=True)
@@ -316,6 +317,13 @@ if __name__ == "__main__":
             )
         )
         exit()
+    if not args.get("data_source") or args["data_source"] not in DATASOURCES:
+        print(
+            "--data_source has to be one of: {}.".format(
+                ", ".join(["<{}>".format(mode) for mode in DATASOURCES])
+            )
+        )
+        exit()
     # End of handling of arguments
 
     # Checking gpu availability
@@ -325,7 +333,10 @@ if __name__ == "__main__":
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     # ------------
-    vocab_size, train_data, val_data, encode, decode = get_shakespeare_train_val_data()
+    if args["data_source"] == TINYSTORIES_DATASOURCE:
+        vocab_size, get_train_batch, get_val_batch, encode, decode = get_tinystories()
+    else:
+        vocab_size, get_train_batch, get_val_batch, encode, decode = get_shakespeare()
 
     # Start from checkpoint or from scratch
     if "from_checkpoint" in args:
@@ -340,10 +351,11 @@ if __name__ == "__main__":
         torch.manual_seed(1337)
         # hyperparameters
         hyperparameters = {
+            "datasource": args["data_source"],
             "vocab_size": vocab_size,
             "batch_size": 128,  # how many independent sequences will we process in parallel?
             "block_size": 256,  # what is the maximum context length for predictions?
-            "max_iters": 1500,
+            "max_iters": 1000,
             "eval_interval": 250,
             "eval_iters": 50,
             "checkpoint_interval": 500,
@@ -372,11 +384,23 @@ if __name__ == "__main__":
     # print the number of parameters in the model
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
 
+    train_batch_iterator = get_train_batch(
+        hyperparameters["block_size"],
+        hyperparameters["batch_size"],
+        hyperparameters["prediction_mode"],
+        device,
+    )
+    val_batch_iterator = get_val_batch(
+        hyperparameters["block_size"],
+        hyperparameters["batch_size"],
+        hyperparameters["prediction_mode"],
+        device,
+    )
     checkpoint_id = "checkpoints/checkpoint_{}".format(int(time.time()))
     loss_timeline = loss_timeline + train(
         model,
-        train_data,
-        val_data,
+        train_batch_iterator,
+        val_batch_iterator,
         hyperparameters,
         device,
         checkpoint_id,
@@ -385,9 +409,17 @@ if __name__ == "__main__":
     # generate from the model
     tic = time.time()
     if hyperparameters["prediction_mode"] == NEXT_TOKEN:
-        context = torch.tensor([encode("KING:")], device=device)
+        context = (
+            torch.tensor([encode("KING:")], device=device)
+            if hyperparameters["datasource"] == SHAKESPEARE_DATASOURCE
+            else torch.tensor([encode("Mary said")], device=device)
+        )
     elif hyperparameters["prediction_mode"] == PREV_TOKEN:
-        context = torch.tensor([encode("the king.")], device=device)
+        context = (
+            torch.tensor([encode("the king.")], device=device)
+            if hyperparameters["datasource"] == SHAKESPEARE_DATASOURCE
+            else torch.tensor([encode("to the party.")], device=device)
+        )
     else:
         raise ValueError(WRONG_PREDICTION_MODE)
     generation = decode(model.generate(context, max_new_tokens=250)[0].tolist())
