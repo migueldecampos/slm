@@ -22,6 +22,7 @@ def train(
     hyperparameters,
     device,
     checkpoint_id,
+    iterations_from_previous_run,
 ):
     m = model.to(device)
     # create a PyTorch optimizer
@@ -29,6 +30,7 @@ def train(
     tic = time.time()
     loss_timeline = list()
     for iter in range(hyperparameters["max_iters"]):
+        total_number_of_iterations_over_all_runs = iterations_from_previous_run + iter
         # every once in a while evaluate the loss on train and val sets
         if (
             iter % hyperparameters["eval_interval"] == 0
@@ -41,7 +43,7 @@ def train(
             )
             loss_timeline.append((iter, losses))
             print(
-                f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+                f"step {total_number_of_iterations_over_all_runs}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
             )
         if (
             iter % hyperparameters["checkpoint_interval"] == 0
@@ -49,7 +51,8 @@ def train(
         ):
             save_checkpoint(
                 file_path="{checkpoint_id}_{num:06}".format(
-                    checkpoint_id=checkpoint_id, num=iter
+                    checkpoint_id=checkpoint_id,
+                    num=total_number_of_iterations_over_all_runs,
                 ),
                 model=model,
                 hyperparameters=hyperparameters,
@@ -121,22 +124,19 @@ if __name__ == "__main__":
         hyperparameters = {
             "datasource": args["datasource"],
             "vocab_size": vocab_size,
-            "batch_size": 128,  # how many independent sequences will we process in parallel?
-            "block_size": 256,  # what is the maximum context length for predictions?
-            "max_iters": 1000,
+            "batch_size": 64,  # how many independent sequences will we process in parallel?
+            "block_size": 512,  # what is the maximum context length for predictions?
+            "max_iters": 6000,
             "eval_interval": 250,
             "eval_iters": 50,
             "checkpoint_interval": 500,
             "learning_rate": 3e-4,
             "n_embd": 384,
-            "n_head": 3,
-            "n_layer": 4,
+            "n_head": 4,
+            "n_layer": 6,
             "dropout": 0.2,
             "prediction_mode": args["prediction_mode"],
         }
-        print("hyperparameters:")
-        print(hyperparameters)
-        print()
         model = GPTLanguageModel(
             vocab_size=hyperparameters["vocab_size"],
             n_embd=hyperparameters["n_embd"],
@@ -149,6 +149,9 @@ if __name__ == "__main__":
         )
         loss_timeline = list()
 
+    print("hyperparameters:")
+    print(hyperparameters)
+    print()
     # print the number of parameters in the model
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
 
@@ -164,6 +167,24 @@ if __name__ == "__main__":
         hyperparameters["prediction_mode"],
         device,
     )
+    iterations_from_previous_run = 0
+    if "from_checkpoint" in args:
+        iterations_from_previous_run = hyperparameters["max_iters"]
+        number_of_batches_from_previous_run = (
+            hyperparameters["max_iters"]
+            + hyperparameters["max_iters"] // hyperparameters["eval_interval"]
+            + 2
+        )
+        print(
+            "Dry run of {} batches from previous run.".format(
+                number_of_batches_from_previous_run
+            )
+        )
+        tic = time.time()
+        for i in range(number_of_batches_from_previous_run):
+            next(train_batch_iterator)
+        print("Dry run took {}.".format(int(time.time() - tic)))
+
     checkpoint_id = "checkpoints/checkpoint_{}".format(int(time.time()))
     loss_timeline = loss_timeline + train(
         model,
@@ -172,6 +193,7 @@ if __name__ == "__main__":
         hyperparameters,
         device,
         checkpoint_id,
+        iterations_from_previous_run,
     )
 
     # generate from the model
@@ -180,7 +202,7 @@ if __name__ == "__main__":
         context = (
             torch.tensor([encode("KING:")], device=device)
             if hyperparameters["datasource"] == SHAKESPEARE_DATASOURCE
-            else torch.tensor([encode("Mary said")], device=device)
+            else torch.tensor([encode("Once upon a time")], device=device)
         )
     elif hyperparameters["prediction_mode"] == PREV_TOKEN:
         context = (
