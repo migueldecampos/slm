@@ -38,8 +38,9 @@ if __name__ == "__main__":
 
     max_new_tokens = int(sys.argv[2])
     prompt = sys.argv[3]
-    print(prompt)
-    print("max new tokens:", max_new_tokens)
+    print("Prompt:", prompt)
+    print("Max new tokens:", max_new_tokens)
+    print()
 
     generation = infer(
         model,
@@ -50,3 +51,4 @@ if __name__ == "__main__":
         device=device,
     )
     print(generation)
+    print()
